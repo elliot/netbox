@@ -27,6 +27,7 @@ __all__ = (
     'parse_job_timeout',
     'resolve_install_paths',
     'secret_key_hint',
+    'sentinel_timeout',
     'uses_sentinel',
     'validate_webhook_default_timeout',
 )
@@ -295,6 +296,26 @@ def _credentials(config, user_key, pass_key):
     return credentials
 
 
+def sentinel_timeout(config):
+    """Return SENTINEL_TIMEOUT (default 10) as a number of seconds.
+
+    Accepts an int or float, a numeric string, or None (no timeout). Anything else raises
+    ImproperlyConfigured at startup rather than failing on the first Redis connection.
+    """
+    value = config.get('SENTINEL_TIMEOUT', 10)
+    if value is None or (isinstance(value, (int, float)) and not isinstance(value, bool)):
+        return value
+    if isinstance(value, str):
+        for number_type in (int, float):
+            try:
+                return number_type(value.strip())
+            except ValueError:
+                pass
+    raise ImproperlyConfigured(
+        f"REDIS SENTINEL_TIMEOUT must be a number of seconds (found {value!r})"
+    )
+
+
 def build_sentinel_kwargs(config):
     """Build the connection kwargs for the Sentinel nodes themselves (redis-py's sentinel_kwargs).
 
@@ -306,7 +327,7 @@ def build_sentinel_kwargs(config):
     """
     kwargs = {key: value for key, value in (config.get('KWARGS') or {}).items() if key.startswith('socket_')}
     kwargs.update(config.get('SENTINEL_KWARGS') or {})
-    kwargs['socket_connect_timeout'] = config.get('SENTINEL_TIMEOUT', 10)
+    kwargs['socket_connect_timeout'] = sentinel_timeout(config)
     if config.get('SENTINEL_AUTH', False):
         kwargs.update(_credentials(config, 'USERNAME', 'PASSWORD'))
     kwargs.update(_credentials(config, 'SENTINEL_USERNAME', 'SENTINEL_PASSWORD'))
@@ -406,7 +427,7 @@ def build_rq_params(config, default_timeout):
             'MASTER_NAME': config.get('SENTINEL_SERVICE', 'default'),
             'SOCKET_TIMEOUT': None,
             'CONNECTION_KWARGS': {
-                'socket_connect_timeout': config.get('SENTINEL_TIMEOUT', 10),
+                'socket_connect_timeout': sentinel_timeout(config),
                 **_ssl_kwargs(config),
                 **(config.get('KWARGS') or {}),
             },
@@ -478,7 +499,7 @@ def build_caches(config):
         location = f"{proto}://{config.get('SENTINEL_SERVICE', 'default')}/{database}"
         options['CLIENT_CLASS'] = 'django_redis.client.SentinelClient'
         options['SENTINELS'] = config['SENTINELS']
-        options['SOCKET_CONNECT_TIMEOUT'] = config.get('SENTINEL_TIMEOUT', 10)
+        options['SOCKET_CONNECT_TIMEOUT'] = sentinel_timeout(config)
         options['SENTINEL_KWARGS'] = build_sentinel_kwargs(config)
     if config.get('INSECURE_SKIP_TLS_VERIFY', False):
         options.setdefault('CONNECTION_POOL_KWARGS', {})

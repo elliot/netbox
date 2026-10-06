@@ -991,6 +991,39 @@ class SentinelKwargsTest(SimpleTestCase):
         self.assertEqual(sentinel_node_kwargs['socket_timeout'], 5)
         self.assertIs(sentinel_node_kwargs['socket_keepalive'], True)
 
+    def test_sentinel_timeout_coercion(self):
+        for value, expected in ((5, 5), (2.5, 2.5), ('5', 5), (' 2.5 ', 2.5), (None, None)):
+            with self.subTest(value=value):
+                self.assertEqual(settings_utils.sentinel_timeout({'SENTINEL_TIMEOUT': value}), expected)
+        self.assertEqual(settings_utils.sentinel_timeout({}), 10)
+
+    def test_sentinel_timeout_invalid_raises(self):
+        for value in ('abc', '', True, [5], {'seconds': 5}):
+            with self.subTest(value=value):
+                with self.assertRaisesMessage(ImproperlyConfigured, 'SENTINEL_TIMEOUT'):
+                    settings_utils.sentinel_timeout({'SENTINEL_TIMEOUT': value})
+
+    def test_sentinel_timeout_string_is_coerced_for_both_sections(self):
+        config = {'SENTINELS': [('s1', 26379)], 'SENTINEL_TIMEOUT': '5'}
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertEqual(params['CONNECTION_KWARGS']['socket_connect_timeout'], 5)
+        self.assertEqual(params['SENTINEL_KWARGS']['socket_connect_timeout'], 5)
+        caches, _ = settings_utils.build_caches(config)
+        self.assertEqual(caches['default']['OPTIONS']['SOCKET_CONNECT_TIMEOUT'], 5)
+        self.assertEqual(caches['default']['OPTIONS']['SENTINEL_KWARGS']['socket_connect_timeout'], 5)
+
+    def test_sentinel_timeout_invalid_raises_for_both_sections(self):
+        config = {'SENTINELS': [('s1', 26379)], 'SENTINEL_TIMEOUT': 'abc'}
+        with self.assertRaisesMessage(ImproperlyConfigured, 'SENTINEL_TIMEOUT'):
+            settings_utils.build_rq_params(config, 300)
+        with self.assertRaisesMessage(ImproperlyConfigured, 'SENTINEL_TIMEOUT'):
+            settings_utils.build_caches(config)
+
+    def test_sentinel_timeout_ignored_outside_sentinel_mode(self):
+        config = {'SENTINEL_TIMEOUT': 'abc'}
+        settings_utils.build_rq_params(config, 300)
+        settings_utils.build_caches(config)
+
     def test_input_not_mutated(self):
         sentinel_kwargs = {'ssl': True}
         config = {'SENTINEL_KWARGS': sentinel_kwargs, 'SENTINEL_PASSWORD': 'sentinel-secret'}
