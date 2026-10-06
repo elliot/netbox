@@ -17,6 +17,7 @@ __all__ = (
     'InstallPaths',
     'build_caches',
     'build_rq_params',
+    'build_sentinel_kwargs',
     'get_configuration_dir',
     'load_configuration',
     'load_ldap_config',
@@ -281,6 +282,34 @@ def uses_sentinel(config):
     return isinstance(sentinels, (list, tuple)) and len(sentinels) > 0
 
 
+def _credentials(config, user_key, pass_key):
+    """Return the username/password connection kwargs held under the given keys, omitting empty values."""
+    credentials = {}
+    if username := config.get(user_key):
+        credentials['username'] = username
+    if password := config.get(pass_key):
+        credentials['password'] = password
+    return credentials
+
+
+def build_sentinel_kwargs(config):
+    """Build the connection kwargs for the Sentinel nodes themselves (redis-py's sentinel_kwargs).
+
+    Lowest to highest precedence: any socket_* options in KWARGS (which redis-py itself copies to the
+    Sentinel nodes when no sentinel_kwargs are given), SENTINEL_KWARGS, SENTINEL_TIMEOUT (always applied
+    as the connect timeout), the data-node USERNAME/PASSWORD (only if SENTINEL_AUTH is enabled), then
+    SENTINEL_USERNAME/SENTINEL_PASSWORD. Data-node credentials are never sent to Sentinel unless
+    SENTINEL_AUTH is enabled.
+    """
+    kwargs = {key: value for key, value in (config.get('KWARGS') or {}).items() if key.startswith('socket_')}
+    kwargs.update(config.get('SENTINEL_KWARGS') or {})
+    kwargs['socket_connect_timeout'] = config.get('SENTINEL_TIMEOUT', 10)
+    if config.get('SENTINEL_AUTH', False):
+        kwargs.update(_credentials(config, 'USERNAME', 'PASSWORD'))
+    kwargs.update(_credentials(config, 'SENTINEL_USERNAME', 'SENTINEL_PASSWORD'))
+    return kwargs
+
+
 def build_rq_params(config, default_timeout):
     """Build the django-rq connection parameters (RQ_PARAMS) from REDIS['tasks'].
 
@@ -295,6 +324,7 @@ def build_rq_params(config, default_timeout):
             'CONNECTION_KWARGS': {
                 'socket_connect_timeout': config.get('SENTINEL_TIMEOUT', 10),
             },
+            'SENTINEL_KWARGS': build_sentinel_kwargs(config),
         }
     elif url := config.get('URL'):
         params = {
@@ -343,11 +373,13 @@ def build_caches(config):
         'PASSWORD': config.get('PASSWORD', ''),
     }
 
-    if sentinels := config.get('SENTINELS', []):
+    if uses_sentinel(config):
         factory = 'django_redis.pool.SentinelConnectionFactory'
         location = f"{proto}://{config.get('SENTINEL_SERVICE', 'default')}/{database}"
         options['CLIENT_CLASS'] = 'django_redis.client.SentinelClient'
-        options['SENTINELS'] = sentinels
+        options['SENTINELS'] = config['SENTINELS']
+        options['SOCKET_CONNECT_TIMEOUT'] = config.get('SENTINEL_TIMEOUT', 10)
+        options['SENTINEL_KWARGS'] = build_sentinel_kwargs(config)
     if config.get('INSECURE_SKIP_TLS_VERIFY', False):
         options.setdefault('CONNECTION_POOL_KWARGS', {})
         options['CONNECTION_POOL_KWARGS']['ssl_cert_reqs'] = False
