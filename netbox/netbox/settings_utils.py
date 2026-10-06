@@ -7,20 +7,28 @@ import sys
 import threading
 import warnings
 from typing import NamedTuple
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 from django.core.exceptions import ImproperlyConfigured
+from redis.connection import URL_QUERY_ARGUMENT_PARSERS, to_bool
 from rq.exceptions import TimeoutFormatError
 from rq.queue import Queue
 from rq.utils import parse_timeout
 
 __all__ = (
     'InstallPaths',
+    'build_caches',
+    'build_rq_params',
+    'build_sentinel_kwargs',
+    'embed_redis_url_credentials',
     'get_configuration_dir',
     'load_configuration',
     'load_ldap_config',
     'parse_job_timeout',
     'resolve_install_paths',
     'secret_key_hint',
+    'sentinel_timeout',
+    'uses_sentinel',
     'validate_webhook_default_timeout',
 )
 
@@ -266,3 +274,249 @@ def load_ldap_config(config_dir, *, allow_legacy_fallback=False):
         "alongside configuration.py. For a pip-installed NetBox, this is "
         "NETBOX_ROOT/conf/ldap_config.py."
     )
+
+
+#
+# Redis
+#
+
+def uses_sentinel(config):
+    """Return True if a REDIS subsection (tasks or caching) is configured to use Redis Sentinel."""
+    sentinels = config.get('SENTINELS', [])
+    return isinstance(sentinels, (list, tuple)) and len(sentinels) > 0
+
+
+def _credentials(config, user_key, pass_key):
+    """Return the username/password connection kwargs held under the given keys, omitting empty values."""
+    credentials = {}
+    if username := config.get(user_key):
+        credentials['username'] = username
+    if password := config.get(pass_key):
+        credentials['password'] = password
+    return credentials
+
+
+def sentinel_timeout(config):
+    """Return SENTINEL_TIMEOUT (default 10) as a number of seconds.
+
+    Accepts an int or float, a numeric string, or None (no timeout). Anything else raises
+    ImproperlyConfigured at startup rather than failing on the first Redis connection.
+    """
+    value = config.get('SENTINEL_TIMEOUT', 10)
+    if value is None or (isinstance(value, (int, float)) and not isinstance(value, bool)):
+        return value
+    if isinstance(value, str):
+        for number_type in (int, float):
+            try:
+                return number_type(value.strip())
+            except ValueError:
+                pass
+    raise ImproperlyConfigured(
+        f"REDIS SENTINEL_TIMEOUT must be a number of seconds (found {value!r})"
+    )
+
+
+def build_sentinel_kwargs(config):
+    """Build the connection kwargs for the Sentinel nodes themselves (redis-py's sentinel_kwargs).
+
+    Lowest to highest precedence: any socket_* options in KWARGS (which redis-py itself copies to the
+    Sentinel nodes when no sentinel_kwargs are given), SENTINEL_KWARGS, SENTINEL_TIMEOUT (always applied
+    as the connect timeout), the data-node USERNAME/PASSWORD (only if SENTINEL_AUTH is enabled), then
+    SENTINEL_USERNAME/SENTINEL_PASSWORD. Data-node credentials are never sent to Sentinel unless
+    SENTINEL_AUTH is enabled.
+    """
+    kwargs = {key: value for key, value in (config.get('KWARGS') or {}).items() if key.startswith('socket_')}
+    kwargs.update(config.get('SENTINEL_KWARGS') or {})
+    kwargs['socket_connect_timeout'] = sentinel_timeout(config)
+    if config.get('SENTINEL_AUTH', False):
+        kwargs.update(_credentials(config, 'USERNAME', 'PASSWORD'))
+    kwargs.update(_credentials(config, 'SENTINEL_USERNAME', 'SENTINEL_PASSWORD'))
+    return kwargs
+
+
+def _ssl_kwargs(config):
+    """Return the TLS connection kwargs for the Redis data node (empty unless SSL is enabled)."""
+    if not config.get('SSL', False):
+        return {}
+    kwargs = {
+        'ssl': True,
+        'ssl_cert_reqs': None if config.get('INSECURE_SKIP_TLS_VERIFY', False) else 'required',
+    }
+    if ca_cert_path := config.get('CA_CERT_PATH'):
+        kwargs['ssl_ca_certs'] = ca_cert_path
+    return kwargs
+
+
+def embed_redis_url_credentials(url, username, password, query):
+    """Return a Redis URL augmented with credentials and query parameters.
+
+    Anything already in the URL wins. The username and password are each percent-encoded and added
+    only if the URL does not already provide that field, either in its userinfo or as a query
+    parameter (redis-py lets userinfo override the query, so adding it there would invert this).
+    Query parameters are added only where the URL does not already set them.
+    Handles redis://, rediss:// and unix:// URLs, including IPv6 hosts.
+    """
+    parts = urlsplit(url)
+    existing = parse_qs(parts.query, keep_blank_values=True)
+
+    # Work on the raw (still percent-encoded) userinfo so that existing values are kept verbatim.
+    raw_userinfo, has_userinfo, hostport = parts.netloc.rpartition('@')
+    if not has_userinfo:
+        hostport = parts.netloc
+    raw_username, has_password, raw_password = raw_userinfo.partition(':')
+    if username and not raw_username and 'username' not in existing:
+        raw_username = quote(str(username), safe='')
+    if password and not raw_password and 'password' not in existing:
+        raw_password = quote(str(password), safe='')
+        has_password = ':'
+    netloc = hostport
+    if raw_username or has_password or has_userinfo:
+        netloc = f"{raw_username}{has_password}{raw_password}@{hostport}"
+
+    extra = urlencode([(key, value) for key, value in query.items() if key not in existing])
+    if netloc == parts.netloc and not extra:
+        return url
+    # Assembled by hand: urlunsplit() drops the empty authority of unix:///path URLs.
+    new_url = f'{parts.scheme}://{netloc}{parts.path}'
+    if new_query := '&'.join(filter(None, [parts.query, extra])):
+        new_url += f'?{new_query}'
+    if parts.fragment:
+        new_url += f'#{parts.fragment}'
+    return new_url
+
+
+def _url_safe_kwargs(kwargs):
+    """Convert KWARGS to Redis URL query parameters, or raise ImproperlyConfigured if that is not possible.
+
+    redis-py parses query parameters back into Python values for the keys listed in
+    URL_QUERY_ARGUMENT_PARSERS; any other key is passed through as a string.
+    """
+    query = {}
+    for key, value in kwargs.items():
+        parser = URL_QUERY_ARGUMENT_PARSERS.get(key)
+        if isinstance(value, str):
+            encodable = True
+        elif isinstance(value, bool):
+            encodable = parser is to_bool
+        elif isinstance(value, int):
+            encodable = parser in (int, float)
+        elif isinstance(value, float):
+            encodable = parser is float
+        else:
+            encodable = False
+        if not encodable:
+            raise ImproperlyConfigured(
+                f"REDIS['tasks']['KWARGS'][{key!r}] (of type {type(value).__name__}) cannot be encoded in "
+                f"the Redis URL. Configure the connection using HOST and PORT instead of URL to pass this option."
+            )
+        query[key] = str(value)
+    return query
+
+
+def build_rq_params(config, default_timeout):
+    """Build the django-rq connection parameters (RQ_PARAMS) from REDIS['tasks'].
+
+    Sentinel takes precedence over URL, which takes precedence over HOST/PORT. django-rq honours
+    only CONNECTION_KWARGS and SENTINEL_KWARGS in Sentinel mode, and only the URL itself in URL
+    mode, so the TLS options, credentials and KWARGS are carried there for those modes.
+    """
+    ssl_cert_reqs = None if config.get('INSECURE_SKIP_TLS_VERIFY', False) else 'required'
+    if uses_sentinel(config):
+        params = {
+            'SENTINELS': config['SENTINELS'],
+            'MASTER_NAME': config.get('SENTINEL_SERVICE', 'default'),
+            'SOCKET_TIMEOUT': None,
+            'CONNECTION_KWARGS': {
+                'socket_connect_timeout': sentinel_timeout(config),
+                **_ssl_kwargs(config),
+                **(config.get('KWARGS') or {}),
+            },
+            'SENTINEL_KWARGS': build_sentinel_kwargs(config),
+        }
+    elif url := config.get('URL'):
+        query = {}
+        kwargs = config.get('KWARGS') or {}
+        # TLS options are only accepted by TLS connections, i.e. a rediss:// URL
+        is_tls_url = urlsplit(url).scheme.lower() == 'rediss'
+        if (ca_cert_path := config.get('CA_CERT_PATH')) and is_tls_url:
+            query['ssl_ca_certs'] = ca_cert_path
+        if not is_tls_url and (ssl_keys := sorted(key for key in kwargs if key.startswith('ssl_'))):
+            raise ImproperlyConfigured(
+                f"REDIS['tasks']['KWARGS'] sets TLS options ({', '.join(ssl_keys)}) but URL does not use the "
+                f"rediss:// scheme. Use a rediss:// URL, or remove these options."
+            )
+        query.update(_url_safe_kwargs(kwargs))
+        params = {
+            'URL': embed_redis_url_credentials(
+                url, config.get('USERNAME', ''), config.get('PASSWORD', ''), query
+            ),
+            'SSL': config.get('SSL', False),
+            'SSL_CERT_REQS': ssl_cert_reqs,
+        }
+    else:
+        params = {
+            'HOST': config.get('HOST', 'localhost'),
+            'PORT': config.get('PORT', 6379),
+            'SSL': config.get('SSL', False),
+            'SSL_CERT_REQS': ssl_cert_reqs,
+        }
+    params.update({
+        'DB': config.get('DATABASE', 0),
+        'USERNAME': config.get('USERNAME', ''),
+        'PASSWORD': config.get('PASSWORD', ''),
+        'DEFAULT_TIMEOUT': default_timeout,
+    })
+    if ca_cert_path := config.get('CA_CERT_PATH', False):
+        params.setdefault('REDIS_CLIENT_KWARGS', {})
+        params['REDIS_CLIENT_KWARGS']['ssl_ca_certs'] = ca_cert_path
+    # Merge in KWARGS for additional parameters
+    if kwargs := config.get('KWARGS'):
+        params.setdefault('REDIS_CLIENT_KWARGS', {})
+        params['REDIS_CLIENT_KWARGS'].update(kwargs)
+    return params
+
+
+def build_caches(config):
+    """Build Django's CACHES setting and the django-redis connection factory from REDIS['caching'].
+
+    Returns a (CACHES, DJANGO_REDIS_CONNECTION_FACTORY) tuple. Sentinel takes precedence over URL,
+    which takes precedence over HOST/PORT.
+    """
+    username = config.get('USERNAME', '')
+    database = config.get('DATABASE', 0)
+    proto = 'rediss' if config.get('SSL', False) else 'redis'
+    username_host = '@'.join(filter(None, [username, config.get('HOST', 'localhost')]))
+    location = config.get('URL', f"{proto}://{username_host}:{config.get('PORT', 6379)}/{database}")
+    factory = 'django_redis.pool.ConnectionFactory'
+    options = {
+        'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+        'USERNAME': username,
+        'PASSWORD': config.get('PASSWORD', ''),
+    }
+
+    if uses_sentinel(config):
+        factory = 'django_redis.pool.SentinelConnectionFactory'
+        location = f"{proto}://{config.get('SENTINEL_SERVICE', 'default')}/{database}"
+        options['CLIENT_CLASS'] = 'django_redis.client.SentinelClient'
+        options['SENTINELS'] = config['SENTINELS']
+        options['SOCKET_CONNECT_TIMEOUT'] = sentinel_timeout(config)
+        options['SENTINEL_KWARGS'] = build_sentinel_kwargs(config)
+    if config.get('INSECURE_SKIP_TLS_VERIFY', False):
+        options.setdefault('CONNECTION_POOL_KWARGS', {})
+        options['CONNECTION_POOL_KWARGS']['ssl_cert_reqs'] = None
+    if ca_cert_path := config.get('CA_CERT_PATH', False):
+        options.setdefault('CONNECTION_POOL_KWARGS', {})
+        options['CONNECTION_POOL_KWARGS']['ssl_ca_certs'] = ca_cert_path
+    # Merge in KWARGS for additional parameters
+    if kwargs := config.get('KWARGS'):
+        options.setdefault('CONNECTION_POOL_KWARGS', {})
+        options['CONNECTION_POOL_KWARGS'].update(kwargs)
+
+    caches = {
+        'default': {
+            'BACKEND': 'django_redis.cache.RedisCache',
+            'LOCATION': location,
+            'OPTIONS': options,
+        }
+    }
+    return caches, factory

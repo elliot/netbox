@@ -162,6 +162,19 @@ REDIS = {
 }
 ```
 
+`URL` takes precedence over `HOST` and `PORT`, while `SENTINELS` (if set) takes precedence over `URL`. The URL may use the `redis://`, `rediss://` (TLS), or `unix://` scheme.
+
+When a URL is used for `tasks`, the other connection options are merged into it:
+
+* `USERNAME` and `PASSWORD` are each percent-encoded and added to the URL, unless the URL already provides that value, either before the host (`redis://user:password@host`) or as a `username` or `password` query parameter.
+* `CA_CERT_PATH` is added as the `ssl_ca_certs` query parameter for `rediss://` URLs, and ignored for other schemes.
+* Each `KWARGS` item is added as a query parameter. Strings are always accepted. Numbers and booleans are accepted only for the parameters which redis-py converts back from a URL (for example `socket_timeout`, `socket_connect_timeout`, `health_check_interval` or `ssl_check_hostname`). Any other value (for example a dictionary or `None`) raises a configuration error at startup; use `HOST` and `PORT` instead of `URL` to pass such options. TLS options (`ssl_*`) are only accepted with a `rediss://` URL, and raise a configuration error otherwise.
+
+Anything already present in the URL, whether credentials or a query parameter, wins over the corresponding option. For `caching`, `USERNAME`, `PASSWORD`, `CA_CERT_PATH` and `KWARGS` are passed to django-redis alongside the URL.
+
+!!! warning
+    Because the `tasks` credentials are embedded in the URL, the password appears in the `RQ_QUEUES` setting, which Django shows on its error pages when [`DEBUG`](./development.md#debug) is enabled. Never enable `DEBUG` on a production system.
+
 ### Using Redis Sentinel
 
 If you are using [Redis Sentinel](https://redis.io/topics/sentinel) for high-availability purposes, there is minimal 
@@ -171,7 +184,14 @@ above and the addition of three new keys.
 * `SENTINELS`: List of tuples or tuple of tuples with each inner tuple containing the name or IP address 
 of the Redis server and port for each sentinel instance to connect to
 * `SENTINEL_SERVICE`: Name of the master / service to connect to
-* `SENTINEL_TIMEOUT`: Connection timeout, in seconds
+* `SENTINEL_TIMEOUT`: Connection timeout, in seconds (default: `10`). This may be a number or a numeric string, and applies both to the Sentinel nodes and to the Redis server they point to.
+
+The `USERNAME`, `PASSWORD`, `SSL`, `CA_CERT_PATH`, `INSECURE_SKIP_TLS_VERIFY` and `KWARGS` keys apply to the Redis server (the master) which Sentinel points to, not to the Sentinel nodes themselves. The exception is any `socket_*` options in `KWARGS`, which apply to both (see below).
+
+In `tasks`, `KWARGS` are passed to the connection class used for the Redis server, so a key which that class does not accept causes an error when NetBox first connects.
+
+!!! warning "TLS with Sentinel for caching"
+    `SSL`, `CA_CERT_PATH` and `INSECURE_SKIP_TLS_VERIFY` work with Sentinel for `tasks` only. Using Sentinel with `SSL` enabled for `caching` is a known limitation: the cache connection then uses a plain TLS connection to a host named after `SENTINEL_SERVICE` instead of the master which Sentinel reports, so it fails. TLS to the Sentinel nodes themselves can still be configured through `SENTINEL_KWARGS`.
 
 Example:
 
@@ -201,6 +221,54 @@ REDIS = {
 !!! note
     It is permissible to use Sentinel for only one database and not the other.
 
+#### Sentinel Authentication
+
+Sentinel nodes are configured independently of the Redis servers they monitor (`sentinel.conf` versus `redis.conf`), and their credentials often differ. NetBox therefore does not send the Redis server credentials to the Sentinel nodes unless instructed to. The following optional keys control how NetBox connects to the Sentinel nodes:
+
+* `SENTINEL_AUTH`: Set to `True` to reuse `USERNAME` and `PASSWORD` when connecting to the Sentinel nodes (default: `False`). Leave this disabled if the Sentinel nodes do not require authentication: sending credentials to a Sentinel node with no password configured causes the connection to fail.
+* `SENTINEL_USERNAME`: Username (ACL user) for the Sentinel nodes. Overrides `USERNAME` when `SENTINEL_AUTH` is enabled, and also works without it.
+* `SENTINEL_PASSWORD`: Password for the Sentinel nodes. Overrides `PASSWORD` when `SENTINEL_AUTH` is enabled, and also works without it.
+* `SENTINEL_KWARGS`: Optional dictionary of additional connection parameters for the Sentinel nodes, passed to redis-py as `sentinel_kwargs` (for example, to connect to the Sentinel nodes over TLS).
+
+An empty `SENTINEL_USERNAME` or `SENTINEL_PASSWORD` is treated as unset. When the same parameter is set in more than one place, the order of precedence (highest first) is:
+
+1. `SENTINEL_USERNAME` / `SENTINEL_PASSWORD`
+2. `USERNAME` / `PASSWORD`, if `SENTINEL_AUTH` is enabled
+3. `SENTINEL_TIMEOUT`, which is always applied as the Sentinel connection timeout (`socket_connect_timeout`)
+4. `SENTINEL_KWARGS`
+5. Any `socket_*` options in `KWARGS` (for example `socket_timeout` or `socket_keepalive`), which also apply to the Sentinel nodes, as they would with redis-py's own defaults
+
+Example, with password-protected Sentinel nodes which are reached over TLS:
+
+```python
+REDIS = {
+    'tasks': {
+        'SENTINELS': [('mysentinel.redis.example.com', 26379)],
+        'SENTINEL_SERVICE': 'netbox',
+        'SENTINEL_PASSWORD': 'sentinel-secret',
+        'SENTINEL_KWARGS': {
+            'ssl': True,
+            'ssl_ca_certs': '/etc/ssl/certs/ca.crt',
+        },
+        'PASSWORD': 'redis-secret',
+        'DATABASE': 0,
+    },
+    'caching': {
+        'SENTINELS': [('mysentinel.redis.example.com', 26379)],
+        'SENTINEL_SERVICE': 'netbox',
+        'SENTINEL_PASSWORD': 'sentinel-secret',
+        'SENTINEL_KWARGS': {
+            'ssl': True,
+            'ssl_ca_certs': '/etc/ssl/certs/ca.crt',
+        },
+        'PASSWORD': 'redis-secret',
+        'DATABASE': 1,
+    }
+}
+```
+
+If the Sentinel nodes share the Redis server's credentials, set `'SENTINEL_AUTH': True` in place of `SENTINEL_USERNAME` and `SENTINEL_PASSWORD`.
+
 ### SSL Configuration
 
 If you need to configure SSL/TLS for Redis beyond the basic `SSL`, `CA_CERT_PATH`, and `INSECURE_SKIP_TLS_VERIFY` options (for example, client certificates, a specific TLS version, or custom ciphers), you can pass additional parameters via the `KWARGS` key in either the `tasks` or `caching` subsection.
@@ -208,6 +276,8 @@ If you need to configure SSL/TLS for Redis beyond the basic `SSL`, `CA_CERT_PATH
 NetBox already maps `CA_CERT_PATH` to `ssl_ca_certs` and (for caching) `INSECURE_SKIP_TLS_VERIFY` to `ssl_cert_reqs`; only add `KWARGS` when you need to override or extend those settings (for example, to supply client certificates or restrict TLS version or ciphers).
 
 * `KWARGS` - Optional dictionary of additional SSL/TLS (or other) parameters passed to the Redis client. These are passed directly to the underlying Redis client: for `tasks` to [redis-py](https://redis-py.readthedocs.io/en/stable/connections.html), and for `caching` to the [django-redis](https://github.com/jazzband/django-redis#configure-as-cache-backend) connection pool.
+
+When `tasks` uses Sentinel, `SSL`, `CA_CERT_PATH`, `INSECURE_SKIP_TLS_VERIFY` and `KWARGS` are passed as connection parameters for the Redis server which Sentinel points to; use `SENTINEL_KWARGS` for the Sentinel nodes themselves. When `tasks` uses a URL, `CA_CERT_PATH` and `KWARGS` are encoded in the URL, as described under [UNIX Socket Support](#unix-socket-support).
 
 Example:
 

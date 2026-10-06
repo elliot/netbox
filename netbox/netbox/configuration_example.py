@@ -34,6 +34,13 @@ REDIS = {
         # Comment out `HOST` and `PORT` lines and uncomment the following if using Redis Sentinel
         # 'SENTINELS': [('mysentinel.redis.example.com', 6379)],
         # 'SENTINEL_SERVICE': 'netbox',
+        # Credentials for the Sentinel nodes, which are separate from USERNAME/PASSWORD below. Set SENTINEL_AUTH
+        # to True to reuse USERNAME/PASSWORD, or set SENTINEL_USERNAME/SENTINEL_PASSWORD explicitly.
+        # 'SENTINEL_AUTH': False,
+        # 'SENTINEL_USERNAME': '',
+        # 'SENTINEL_PASSWORD': '',
+        # Additional connection parameters for the Sentinel nodes (e.g. TLS)
+        # 'SENTINEL_KWARGS': {},
         'USERNAME': '',
         'PASSWORD': '',
         'DATABASE': 0,
@@ -50,6 +57,13 @@ REDIS = {
         # Comment out `HOST` and `PORT` lines and uncomment the following if using Redis Sentinel
         # 'SENTINELS': [('mysentinel.redis.example.com', 6379)],
         # 'SENTINEL_SERVICE': 'netbox',
+        # Credentials for the Sentinel nodes, which are separate from USERNAME/PASSWORD below. Set SENTINEL_AUTH
+        # to True to reuse USERNAME/PASSWORD, or set SENTINEL_USERNAME/SENTINEL_PASSWORD explicitly.
+        # 'SENTINEL_AUTH': False,
+        # 'SENTINEL_USERNAME': '',
+        # 'SENTINEL_PASSWORD': '',
+        # Additional connection parameters for the Sentinel nodes (e.g. TLS)
+        # 'SENTINEL_KWARGS': {},
         'USERNAME': '',
         'PASSWORD': '',
         'DATABASE': 1,
