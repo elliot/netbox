@@ -166,11 +166,14 @@ REDIS = {
 
 When a URL is used for `tasks`, the other connection options are merged into it:
 
-* `USERNAME` and `PASSWORD` are percent-encoded and added to the URL, unless the URL already includes credentials of its own.
-* `CA_CERT_PATH` is added as the `ssl_ca_certs` query parameter for `rediss://` URLs.
-* Each `KWARGS` item is added as a query parameter. Strings are always accepted. Numbers and booleans are accepted only for the parameters which redis-py converts back from a URL (for example `socket_timeout`, `socket_connect_timeout`, `health_check_interval` or `ssl_check_hostname`). Any other value (for example a dictionary or `None`) raises a configuration error at startup; use `HOST` and `PORT` instead of `URL` to pass such options.
+* `USERNAME` and `PASSWORD` are each percent-encoded and added to the URL, unless the URL already provides that value, either before the host (`redis://user:password@host`) or as a `username` or `password` query parameter.
+* `CA_CERT_PATH` is added as the `ssl_ca_certs` query parameter for `rediss://` URLs, and ignored for other schemes.
+* Each `KWARGS` item is added as a query parameter. Strings are always accepted. Numbers and booleans are accepted only for the parameters which redis-py converts back from a URL (for example `socket_timeout`, `socket_connect_timeout`, `health_check_interval` or `ssl_check_hostname`). Any other value (for example a dictionary or `None`) raises a configuration error at startup; use `HOST` and `PORT` instead of `URL` to pass such options. TLS options (`ssl_*`) are only accepted with a `rediss://` URL, and raise a configuration error otherwise.
 
 Anything already present in the URL, whether credentials or a query parameter, wins over the corresponding option. For `caching`, `USERNAME`, `PASSWORD`, `CA_CERT_PATH` and `KWARGS` are passed to django-redis alongside the URL.
+
+!!! warning
+    Because the `tasks` credentials are embedded in the URL, the password appears in the `RQ_QUEUES` setting, which Django shows on its error pages when [`DEBUG`](./development.md#debug) is enabled. Never enable `DEBUG` on a production system.
 
 ### Using Redis Sentinel
 
@@ -181,9 +184,14 @@ above and the addition of three new keys.
 * `SENTINELS`: List of tuples or tuple of tuples with each inner tuple containing the name or IP address 
 of the Redis server and port for each sentinel instance to connect to
 * `SENTINEL_SERVICE`: Name of the master / service to connect to
-* `SENTINEL_TIMEOUT`: Connection timeout, in seconds (default: `10`). This applies both to the Sentinel nodes and to the Redis server they point to.
+* `SENTINEL_TIMEOUT`: Connection timeout, in seconds (default: `10`). This may be a number or a numeric string, and applies both to the Sentinel nodes and to the Redis server they point to.
 
 The `USERNAME`, `PASSWORD`, `SSL`, `CA_CERT_PATH`, `INSECURE_SKIP_TLS_VERIFY` and `KWARGS` keys apply to the Redis server (the master) which Sentinel points to, not to the Sentinel nodes themselves. The exception is any `socket_*` options in `KWARGS`, which apply to both (see below).
+
+In `tasks`, `KWARGS` are passed to the connection class used for the Redis server, so a key which that class does not accept causes an error when NetBox first connects.
+
+!!! warning "TLS with Sentinel for caching"
+    `SSL`, `CA_CERT_PATH` and `INSECURE_SKIP_TLS_VERIFY` work with Sentinel for `tasks` only. Using Sentinel with `SSL` enabled for `caching` is a known limitation: the cache connection then uses a plain TLS connection to a host named after `SENTINEL_SERVICE` instead of the master which Sentinel reports, so it fails. TLS to the Sentinel nodes themselves can still be configured through `SENTINEL_KWARGS`.
 
 Example:
 
