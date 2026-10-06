@@ -329,18 +329,29 @@ def _ssl_kwargs(config):
 def embed_redis_url_credentials(url, username, password, query):
     """Return a Redis URL augmented with credentials and query parameters.
 
-    Percent-encoded credentials are added only if the URL carries no userinfo of its own, and
-    query parameters only where the URL does not already set them: anything in the URL wins.
+    Anything already in the URL wins. The username and password are each percent-encoded and added
+    only if the URL does not already provide that field, either in its userinfo or as a query
+    parameter (redis-py lets userinfo override the query, so adding it there would invert this).
+    Query parameters are added only where the URL does not already set them.
     Handles redis://, rediss:// and unix:// URLs, including IPv6 hosts.
     """
     parts = urlsplit(url)
-    netloc = parts.netloc
-    if (username or password) and '@' not in netloc:
-        userinfo = quote(str(username), safe='') if username else ''
-        if password:
-            userinfo += ':' + quote(str(password), safe='')
-        netloc = f'{userinfo}@{netloc}'
     existing = parse_qs(parts.query, keep_blank_values=True)
+
+    # Work on the raw (still percent-encoded) userinfo so that existing values are kept verbatim.
+    raw_userinfo, has_userinfo, hostport = parts.netloc.rpartition('@')
+    if not has_userinfo:
+        hostport = parts.netloc
+    raw_username, has_password, raw_password = raw_userinfo.partition(':')
+    if username and not raw_username and 'username' not in existing:
+        raw_username = quote(str(username), safe='')
+    if password and not raw_password and 'password' not in existing:
+        raw_password = quote(str(password), safe='')
+        has_password = ':'
+    netloc = hostport
+    if raw_username or has_password or has_userinfo:
+        netloc = f"{raw_username}{has_password}{raw_password}@{hostport}"
+
     extra = urlencode([(key, value) for key, value in query.items() if key not in existing])
     if netloc == parts.netloc and not extra:
         return url
@@ -403,10 +414,17 @@ def build_rq_params(config, default_timeout):
         }
     elif url := config.get('URL'):
         query = {}
-        # A CA certificate is only accepted by TLS connections
-        if (ca_cert_path := config.get('CA_CERT_PATH')) and url.startswith('rediss://'):
+        kwargs = config.get('KWARGS') or {}
+        # TLS options are only accepted by TLS connections, i.e. a rediss:// URL
+        is_tls_url = urlsplit(url).scheme.lower() == 'rediss'
+        if (ca_cert_path := config.get('CA_CERT_PATH')) and is_tls_url:
             query['ssl_ca_certs'] = ca_cert_path
-        query.update(_url_safe_kwargs(config.get('KWARGS') or {}))
+        if not is_tls_url and (ssl_keys := sorted(key for key in kwargs if key.startswith('ssl_'))):
+            raise ImproperlyConfigured(
+                f"REDIS['tasks']['KWARGS'] sets TLS options ({', '.join(ssl_keys)}) but URL does not use the "
+                f"rediss:// scheme. Use a rediss:// URL, or remove these options."
+            )
+        query.update(_url_safe_kwargs(kwargs))
         params = {
             'URL': embed_redis_url_credentials(
                 url, config.get('USERNAME', ''), config.get('PASSWORD', ''), query

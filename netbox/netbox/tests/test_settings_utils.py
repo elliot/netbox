@@ -685,6 +685,29 @@ class BuildRqParamsTest(SimpleTestCase):
                 with self.assertRaisesMessage(ImproperlyConfigured, 'HOST and PORT'):
                     settings_utils.build_rq_params({'URL': 'redis://h/0', 'KWARGS': kwargs}, 300)
 
+    def test_url_branch_upper_case_scheme_gets_ca_cert(self):
+        config = {'URL': 'REDISS://h:6380/0', 'CA_CERT_PATH': '/ca.pem'}
+        self.assertEqual(
+            settings_utils.build_rq_params(config, 300)['URL'], 'rediss://h:6380/0?ssl_ca_certs=%2Fca.pem'
+        )
+
+    def test_url_branch_rejects_ssl_kwargs_without_tls_url(self):
+        for url in ('redis://h:6379/0', 'unix:///var/run/redis.sock'):
+            with self.subTest(url=url):
+                config = {'URL': url, 'KWARGS': {'ssl_certfile': '/secret/client.pem', 'socket_timeout': 5}}
+                with self.assertRaisesMessage(ImproperlyConfigured, 'ssl_certfile') as cm:
+                    settings_utils.build_rq_params(config, 300)
+                self.assertNotIn('/secret/client.pem', str(cm.exception))
+
+    def test_url_branch_preserves_query_password(self):
+        from redis.connection import parse_url
+
+        config = {'URL': 'redis://h:6379/0?password=from-url', 'USERNAME': 'netbox', 'PASSWORD': 'secret'}
+        url = settings_utils.build_rq_params(config, 300)['URL']
+        self.assertEqual(url, 'redis://netbox@h:6379/0?password=from-url')
+        self.assertEqual(parse_url(url)['password'], 'from-url')
+        self.assertEqual(parse_url(url)['username'], 'netbox')
+
     def test_url_branch_connection_wiring(self):
         from django_rq.connection_utils import get_redis_connection
 
@@ -1008,3 +1031,19 @@ class EmbedRedisUrlCredentialsTest(SimpleTestCase):
             'unix:///var/run/redis.sock', 'netbox', 'secret', {'db': '3'}
         )
         self.assertEqual(url, 'unix://netbox:secret@/var/run/redis.sock?db=3')
+
+    def test_query_credentials_are_not_overridden(self):
+        url = settings_utils.embed_redis_url_credentials(
+            'redis://h:6379/0?username=u&password=p', 'netbox', 'secret', {}
+        )
+        self.assertEqual(url, 'redis://h:6379/0?username=u&password=p')
+
+    def test_query_username_only_adds_password(self):
+        url = settings_utils.embed_redis_url_credentials('redis://h:6379/0?username=u', 'netbox', 'secret', {})
+        self.assertEqual(url, 'redis://:secret@h:6379/0?username=u')
+
+    def test_userinfo_fields_are_kept_per_field(self):
+        url = settings_utils.embed_redis_url_credentials('redis://other@h:6379/0', 'netbox', 'secret', {})
+        self.assertEqual(url, 'redis://other:secret@h:6379/0')
+        url = settings_utils.embed_redis_url_credentials('redis://:p%40w@h:6379/0', 'netbox', 'secret', {})
+        self.assertEqual(url, 'redis://netbox:p%40w@h:6379/0')
