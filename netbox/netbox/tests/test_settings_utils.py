@@ -535,6 +535,56 @@ class BuildRqParamsTest(SimpleTestCase):
         self.assertEqual(sentinel_node_kwargs['password'], 'sentinel-secret')
         self.assertEqual(sentinel_node_kwargs['socket_connect_timeout'], 4)
 
+    def test_sentinel_ssl_and_kwargs_land_in_connection_kwargs(self):
+        config = {
+            'SENTINELS': [('s1', 26379)],
+            'SENTINEL_TIMEOUT': 3,
+            'SSL': True,
+            'INSECURE_SKIP_TLS_VERIFY': True,
+            'CA_CERT_PATH': '/ca.pem',
+            'KWARGS': {'socket_timeout': 5, 'ssl_check_hostname': False},
+        }
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertEqual(params['CONNECTION_KWARGS'], {
+            'socket_connect_timeout': 3,
+            'ssl': True,
+            'ssl_cert_reqs': None,
+            'ssl_ca_certs': '/ca.pem',
+            'socket_timeout': 5,
+            'ssl_check_hostname': False,
+        })
+        # TLS options for the data node are not applied to the Sentinel nodes; socket options are
+        self.assertEqual(params['SENTINEL_KWARGS'], {'socket_timeout': 5, 'socket_connect_timeout': 3})
+        # REDIS_CLIENT_KWARGS is still emitted, although django-rq ignores it in Sentinel mode
+        self.assertEqual(params['REDIS_CLIENT_KWARGS'], {
+            'ssl_ca_certs': '/ca.pem', 'socket_timeout': 5, 'ssl_check_hostname': False,
+        })
+
+    def test_sentinel_ssl_verifies_certificates_by_default(self):
+        config = {'SENTINELS': [('s1', 26379)], 'SSL': True}
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertEqual(params['CONNECTION_KWARGS'], {
+            'socket_connect_timeout': 10,
+            'ssl': True,
+            'ssl_cert_reqs': 'required',
+        })
+
+    def test_sentinel_without_ssl_ignores_ca_cert_path(self):
+        config = {'SENTINELS': [('s1', 26379)], 'CA_CERT_PATH': '/ca.pem'}
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertEqual(params['CONNECTION_KWARGS'], {'socket_connect_timeout': 10})
+
+    def test_sentinel_ssl_connection_wiring(self):
+        from django_rq.connection_utils import get_redis_connection
+        from redis.sentinel import SentinelManagedSSLConnection
+
+        config = {'SENTINELS': [('s1', 26379)], 'SSL': True, 'CA_CERT_PATH': '/ca.pem'}
+        connection = get_redis_connection(settings_utils.build_rq_params(config, 300))
+        pool = connection.connection_pool
+        self.assertIs(pool.connection_class, SentinelManagedSSLConnection)
+        self.assertEqual(pool.connection_kwargs['ssl_ca_certs'], '/ca.pem')
+        self.assertEqual(pool.connection_kwargs['ssl_cert_reqs'], 'required')
+
     def test_sentinel_takes_precedence_over_url(self):
         config = {'SENTINELS': [('s1', 26379)], 'URL': 'redis://h/0'}
         params = settings_utils.build_rq_params(config, 300)
@@ -553,6 +603,105 @@ class BuildRqParamsTest(SimpleTestCase):
             'PASSWORD': '',
             'DEFAULT_TIMEOUT': 300,
         })
+
+    def test_url_branch_embeds_credentials(self):
+        config = {'URL': 'redis://redis.example.com:6379/1', 'USERNAME': 'netbox', 'PASSWORD': 'secret'}
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertEqual(params['URL'], 'redis://netbox:secret@redis.example.com:6379/1')
+        self.assertEqual(params['USERNAME'], 'netbox')
+        self.assertEqual(params['PASSWORD'], 'secret')
+
+    def test_url_branch_embeds_credentials_for_rediss_and_unix(self):
+        config = {'URL': 'rediss://redis.example.com:6380/0', 'PASSWORD': 'secret'}
+        self.assertEqual(
+            settings_utils.build_rq_params(config, 300)['URL'], 'rediss://:secret@redis.example.com:6380/0'
+        )
+        config = {'URL': 'unix:///var/run/redis.sock?db=2', 'USERNAME': 'netbox', 'PASSWORD': 'secret'}
+        self.assertEqual(
+            settings_utils.build_rq_params(config, 300)['URL'], 'unix://netbox:secret@/var/run/redis.sock?db=2'
+        )
+
+    def test_url_branch_keeps_existing_userinfo(self):
+        config = {'URL': 'redis://other:pw@h:6379/0', 'USERNAME': 'netbox', 'PASSWORD': 'secret'}
+        self.assertEqual(settings_utils.build_rq_params(config, 300)['URL'], 'redis://other:pw@h:6379/0')
+
+    def test_url_branch_encodes_special_characters(self):
+        from redis.connection import parse_url
+
+        config = {'URL': 'redis://h:6379/0', 'USERNAME': 'net@box', 'PASSWORD': 'p@ss:w/rd?#%'}
+        url = settings_utils.build_rq_params(config, 300)['URL']
+        self.assertEqual(url, 'redis://net%40box:p%40ss%3Aw%2Frd%3F%23%25@h:6379/0')
+        parsed = parse_url(url)
+        self.assertEqual(parsed['username'], 'net@box')
+        self.assertEqual(parsed['password'], 'p@ss:w/rd?#%')
+        self.assertEqual(parsed['host'], 'h')
+
+    def test_url_branch_appends_ca_cert_once(self):
+        config = {'URL': 'rediss://h:6380/0', 'SSL': True, 'CA_CERT_PATH': '/etc/ssl/ca.pem'}
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertEqual(params['URL'], 'rediss://h:6380/0?ssl_ca_certs=%2Fetc%2Fssl%2Fca.pem')
+        # A value already present in the URL wins
+        config['URL'] = 'rediss://h:6380/0?ssl_ca_certs=/other.pem'
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertEqual(params['URL'], 'rediss://h:6380/0?ssl_ca_certs=/other.pem')
+
+    def test_url_branch_ca_cert_requires_tls_url(self):
+        # A plain connection rejects ssl_ca_certs, so it is only added to rediss:// URLs.
+        config = {'URL': 'redis://h:6379/0', 'CA_CERT_PATH': '/ca.pem'}
+        self.assertEqual(settings_utils.build_rq_params(config, 300)['URL'], 'redis://h:6379/0')
+
+    def test_url_branch_encodes_kwargs(self):
+        from redis.connection import parse_url
+
+        config = {
+            'URL': 'rediss://h:6380/0',
+            'KWARGS': {
+                'socket_timeout': 5,
+                'socket_connect_timeout': 2.5,
+                'ssl_check_hostname': False,
+                'health_check_interval': 30,
+                'client_name': 'netbox',
+            },
+        }
+        url = settings_utils.build_rq_params(config, 300)['URL']
+        parsed = parse_url(url)
+        self.assertEqual(parsed['socket_timeout'], 5.0)
+        self.assertEqual(parsed['socket_connect_timeout'], 2.5)
+        self.assertIs(parsed['ssl_check_hostname'], False)
+        self.assertEqual(parsed['health_check_interval'], 30)
+        self.assertEqual(parsed['client_name'], 'netbox')
+
+    def test_url_branch_rejects_unencodable_kwargs(self):
+        for kwargs in (
+            {'socket_keepalive_options': {1: 2}},
+            {'retry': object()},
+            {'client_name': None},
+            {'health_check_interval': 1.5},
+            {'socket_keepalive': 1},
+            {'max_connections': True},
+            {'custom_flag': True},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesMessage(ImproperlyConfigured, 'HOST and PORT'):
+                    settings_utils.build_rq_params({'URL': 'redis://h/0', 'KWARGS': kwargs}, 300)
+
+    def test_url_branch_connection_wiring(self):
+        from django_rq.connection_utils import get_redis_connection
+
+        config = {
+            'URL': 'rediss://h:6380/0',
+            'SSL': True,
+            'USERNAME': 'netbox',
+            'PASSWORD': 's3cr@t',
+            'CA_CERT_PATH': '/ca.pem',
+            'KWARGS': {'socket_timeout': 5},
+        }
+        connection = get_redis_connection(settings_utils.build_rq_params(config, 300))
+        connection_kwargs = connection.connection_pool.connection_kwargs
+        self.assertEqual(connection_kwargs['username'], 'netbox')
+        self.assertEqual(connection_kwargs['password'], 's3cr@t')
+        self.assertEqual(connection_kwargs['ssl_ca_certs'], '/ca.pem')
+        self.assertEqual(connection_kwargs['socket_timeout'], 5.0)
 
 
 class BuildCachesTest(SimpleTestCase):
@@ -591,6 +740,15 @@ class BuildCachesTest(SimpleTestCase):
             'CONNECTION_POOL_KWARGS': {'ssl_ca_certs': '/ca.pem', 'socket_timeout': 5},
         })
         self.assertEqual(factory, 'django_redis.pool.ConnectionFactory')
+
+    def test_host_branch_insecure_skip_tls_verify(self):
+        config = {'SSL': True, 'INSECURE_SKIP_TLS_VERIFY': True, 'KWARGS': {'ssl_check_hostname': False}}
+        caches, _ = settings_utils.build_caches(config)
+        self.assertEqual(caches['default']['LOCATION'], 'rediss://localhost:6379/0')
+        self.assertEqual(caches['default']['OPTIONS']['CONNECTION_POOL_KWARGS'], {
+            'ssl_cert_reqs': None,
+            'ssl_check_hostname': False,
+        })
 
     def test_url_branch(self):
         config = {'URL': 'unix:///var/run/redis.sock', 'PASSWORD': 'secret', 'HOST': 'ignored'}
@@ -816,3 +974,37 @@ class SentinelKwargsTest(SimpleTestCase):
         settings_utils.build_sentinel_kwargs(config)
         self.assertEqual(sentinel_kwargs, {'ssl': True})
         self.assertEqual(config, {'SENTINEL_KWARGS': {'ssl': True}, 'SENTINEL_PASSWORD': 'sentinel-secret'})
+
+
+class EmbedRedisUrlCredentialsTest(SimpleTestCase):
+    def test_no_changes_returns_url_unchanged(self):
+        for url in ('redis://h:6379/0', 'unix:///var/run/redis.sock', 'rediss://[::1]:6380/0?db=1'):
+            with self.subTest(url=url):
+                self.assertEqual(settings_utils.embed_redis_url_credentials(url, '', '', {}), url)
+
+    def test_ipv6_host(self):
+        url = settings_utils.embed_redis_url_credentials('redis://[::1]:6379/0', 'netbox', 'secret', {})
+        self.assertEqual(url, 'redis://netbox:secret@[::1]:6379/0')
+
+    def test_password_only(self):
+        url = settings_utils.embed_redis_url_credentials('redis://h:6379/0', '', 'secret', {})
+        self.assertEqual(url, 'redis://:secret@h:6379/0')
+
+    def test_username_only(self):
+        url = settings_utils.embed_redis_url_credentials('redis://h:6379/0', 'netbox', '', {})
+        self.assertEqual(url, 'redis://netbox@h:6379/0')
+
+    def test_existing_query_preserved(self):
+        url = settings_utils.embed_redis_url_credentials(
+            'rediss://h:6380/0?ssl_cert_reqs=none&socket_timeout=1',
+            '',
+            '',
+            {'socket_timeout': '5', 'ssl_ca_certs': '/ca.pem'},
+        )
+        self.assertEqual(url, 'rediss://h:6380/0?ssl_cert_reqs=none&socket_timeout=1&ssl_ca_certs=%2Fca.pem')
+
+    def test_unix_socket(self):
+        url = settings_utils.embed_redis_url_credentials(
+            'unix:///var/run/redis.sock', 'netbox', 'secret', {'db': '3'}
+        )
+        self.assertEqual(url, 'unix://netbox:secret@/var/run/redis.sock?db=3')
