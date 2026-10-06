@@ -405,3 +405,183 @@ class LoadLdapConfigTest(SimpleTestCase):
             django_settings.CONFIGURATION_DIR,
             os.path.dirname(os.path.abspath(configuration_testing.__file__)),
         )
+
+
+class UsesSentinelTest(SimpleTestCase):
+    def test_non_empty_list_or_tuple(self):
+        self.assertTrue(settings_utils.uses_sentinel({'SENTINELS': [('s1', 26379)]}))
+        self.assertTrue(settings_utils.uses_sentinel({'SENTINELS': (('s1', 26379),)}))
+
+    def test_absent_empty_or_wrong_type(self):
+        self.assertFalse(settings_utils.uses_sentinel({}))
+        self.assertFalse(settings_utils.uses_sentinel({'SENTINELS': []}))
+        self.assertFalse(settings_utils.uses_sentinel({'SENTINELS': None}))
+        self.assertFalse(settings_utils.uses_sentinel({'SENTINELS': 's1:26379'}))
+
+
+class BuildRqParamsTest(SimpleTestCase):
+    def test_host_branch_defaults(self):
+        params = settings_utils.build_rq_params({}, 300)
+        self.assertEqual(params, {
+            'HOST': 'localhost',
+            'PORT': 6379,
+            'SSL': False,
+            'SSL_CERT_REQS': 'required',
+            'DB': 0,
+            'USERNAME': '',
+            'PASSWORD': '',
+            'DEFAULT_TIMEOUT': 300,
+        })
+
+    def test_host_branch_is_unchanged(self):
+        config = {
+            'HOST': 'redis.example.com',
+            'PORT': 6380,
+            'USERNAME': 'netbox',
+            'PASSWORD': 'p@ss',
+            'DATABASE': 3,
+            'SSL': True,
+            'INSECURE_SKIP_TLS_VERIFY': True,
+            'CA_CERT_PATH': '/ca.pem',
+            'KWARGS': {'socket_timeout': 5, 'ssl_check_hostname': False},
+        }
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertEqual(params, {
+            'HOST': 'redis.example.com',
+            'PORT': 6380,
+            'SSL': True,
+            'SSL_CERT_REQS': None,
+            'DB': 3,
+            'USERNAME': 'netbox',
+            'PASSWORD': 'p@ss',
+            'DEFAULT_TIMEOUT': 300,
+            'REDIS_CLIENT_KWARGS': {'ssl_ca_certs': '/ca.pem', 'socket_timeout': 5, 'ssl_check_hostname': False},
+        })
+        # Key order is preserved as well
+        self.assertEqual(list(params), [
+            'HOST', 'PORT', 'SSL', 'SSL_CERT_REQS', 'DB', 'USERNAME', 'PASSWORD', 'DEFAULT_TIMEOUT',
+            'REDIS_CLIENT_KWARGS',
+        ])
+
+    def test_host_branch_kwargs_override_ca_cert(self):
+        config = {'CA_CERT_PATH': '/ca.pem', 'KWARGS': {'ssl_ca_certs': '/other.pem'}}
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertEqual(params['REDIS_CLIENT_KWARGS'], {'ssl_ca_certs': '/other.pem'})
+
+    def test_host_branch_does_not_mutate_config(self):
+        kwargs = {'socket_timeout': 5}
+        config = {'CA_CERT_PATH': '/ca.pem', 'KWARGS': kwargs}
+        params = settings_utils.build_rq_params(config, 300)
+        params['REDIS_CLIENT_KWARGS']['extra'] = True
+        self.assertEqual(kwargs, {'socket_timeout': 5})
+
+    def test_sentinel_branch(self):
+        config = {
+            'SENTINELS': [('s1', 26379), ('s2', 26379)],
+            'SENTINEL_SERVICE': 'mymaster',
+            'SENTINEL_TIMEOUT': 3,
+            'USERNAME': 'netbox',
+            'PASSWORD': 'secret',
+            'DATABASE': 1,
+        }
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertEqual(params, {
+            'SENTINELS': [('s1', 26379), ('s2', 26379)],
+            'MASTER_NAME': 'mymaster',
+            'SOCKET_TIMEOUT': None,
+            'CONNECTION_KWARGS': {'socket_connect_timeout': 3},
+            'DB': 1,
+            'USERNAME': 'netbox',
+            'PASSWORD': 'secret',
+            'DEFAULT_TIMEOUT': 300,
+        })
+
+    def test_sentinel_takes_precedence_over_url(self):
+        config = {'SENTINELS': [('s1', 26379)], 'URL': 'redis://h/0'}
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertIn('SENTINELS', params)
+        self.assertNotIn('URL', params)
+
+    def test_url_branch(self):
+        config = {'URL': 'redis://h:6379/1', 'DATABASE': 2}
+        params = settings_utils.build_rq_params(config, 300)
+        self.assertEqual(params, {
+            'URL': 'redis://h:6379/1',
+            'SSL': False,
+            'SSL_CERT_REQS': 'required',
+            'DB': 2,
+            'USERNAME': '',
+            'PASSWORD': '',
+            'DEFAULT_TIMEOUT': 300,
+        })
+
+
+class BuildCachesTest(SimpleTestCase):
+    def test_host_branch_defaults(self):
+        caches, factory = settings_utils.build_caches({})
+        self.assertEqual(caches, {
+            'default': {
+                'BACKEND': 'django_redis.cache.RedisCache',
+                'LOCATION': 'redis://localhost:6379/0',
+                'OPTIONS': {
+                    'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+                    'USERNAME': '',
+                    'PASSWORD': '',
+                },
+            },
+        })
+        self.assertEqual(factory, 'django_redis.pool.ConnectionFactory')
+
+    def test_host_branch_with_tls_and_kwargs(self):
+        config = {
+            'HOST': 'redis.example.com',
+            'PORT': 6380,
+            'USERNAME': 'netbox',
+            'PASSWORD': 'p@ss',
+            'DATABASE': 3,
+            'SSL': True,
+            'CA_CERT_PATH': '/ca.pem',
+            'KWARGS': {'socket_timeout': 5},
+        }
+        caches, factory = settings_utils.build_caches(config)
+        self.assertEqual(caches['default']['LOCATION'], 'rediss://netbox@redis.example.com:6380/3')
+        self.assertEqual(caches['default']['OPTIONS'], {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            'USERNAME': 'netbox',
+            'PASSWORD': 'p@ss',
+            'CONNECTION_POOL_KWARGS': {'ssl_ca_certs': '/ca.pem', 'socket_timeout': 5},
+        })
+        self.assertEqual(factory, 'django_redis.pool.ConnectionFactory')
+
+    def test_url_branch(self):
+        config = {'URL': 'unix:///var/run/redis.sock', 'PASSWORD': 'secret', 'HOST': 'ignored'}
+        caches, factory = settings_utils.build_caches(config)
+        self.assertEqual(caches['default']['LOCATION'], 'unix:///var/run/redis.sock')
+        self.assertEqual(caches['default']['OPTIONS'], {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            'USERNAME': '',
+            'PASSWORD': 'secret',
+        })
+        self.assertEqual(factory, 'django_redis.pool.ConnectionFactory')
+
+    def test_sentinel_branch(self):
+        config = {
+            'SENTINELS': [('s1', 26379)],
+            'SENTINEL_SERVICE': 'mymaster',
+            'URL': 'redis://ignored/0',
+            'PASSWORD': 'secret',
+            'DATABASE': 2,
+        }
+        caches, factory = settings_utils.build_caches(config)
+        self.assertEqual(factory, 'django_redis.pool.SentinelConnectionFactory')
+        self.assertEqual(caches['default']['LOCATION'], 'redis://mymaster/2')
+        self.assertEqual(caches['default']['OPTIONS']['CLIENT_CLASS'], 'django_redis.client.SentinelClient')
+        self.assertEqual(caches['default']['OPTIONS']['SENTINELS'], [('s1', 26379)])
+        self.assertEqual(caches['default']['OPTIONS']['PASSWORD'], 'secret')
+
+    def test_does_not_mutate_config(self):
+        kwargs = {'socket_timeout': 5}
+        config = {'KWARGS': kwargs, 'CA_CERT_PATH': '/ca.pem'}
+        caches, _ = settings_utils.build_caches(config)
+        caches['default']['OPTIONS']['CONNECTION_POOL_KWARGS']['extra'] = True
+        self.assertEqual(kwargs, {'socket_timeout': 5})

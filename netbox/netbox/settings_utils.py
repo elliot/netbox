@@ -15,12 +15,15 @@ from rq.utils import parse_timeout
 
 __all__ = (
     'InstallPaths',
+    'build_caches',
+    'build_rq_params',
     'get_configuration_dir',
     'load_configuration',
     'load_ldap_config',
     'parse_job_timeout',
     'resolve_install_paths',
     'secret_key_hint',
+    'uses_sentinel',
     'validate_webhook_default_timeout',
 )
 
@@ -266,3 +269,101 @@ def load_ldap_config(config_dir, *, allow_legacy_fallback=False):
         "alongside configuration.py. For a pip-installed NetBox, this is "
         "NETBOX_ROOT/conf/ldap_config.py."
     )
+
+
+#
+# Redis
+#
+
+def uses_sentinel(config):
+    """Return True if a REDIS subsection (tasks or caching) is configured to use Redis Sentinel."""
+    sentinels = config.get('SENTINELS', [])
+    return isinstance(sentinels, (list, tuple)) and len(sentinels) > 0
+
+
+def build_rq_params(config, default_timeout):
+    """Build the django-rq connection parameters (RQ_PARAMS) from REDIS['tasks'].
+
+    Sentinel takes precedence over URL, which takes precedence over HOST/PORT.
+    """
+    ssl_cert_reqs = None if config.get('INSECURE_SKIP_TLS_VERIFY', False) else 'required'
+    if uses_sentinel(config):
+        params = {
+            'SENTINELS': config['SENTINELS'],
+            'MASTER_NAME': config.get('SENTINEL_SERVICE', 'default'),
+            'SOCKET_TIMEOUT': None,
+            'CONNECTION_KWARGS': {
+                'socket_connect_timeout': config.get('SENTINEL_TIMEOUT', 10),
+            },
+        }
+    elif url := config.get('URL'):
+        params = {
+            'URL': url,
+            'SSL': config.get('SSL', False),
+            'SSL_CERT_REQS': ssl_cert_reqs,
+        }
+    else:
+        params = {
+            'HOST': config.get('HOST', 'localhost'),
+            'PORT': config.get('PORT', 6379),
+            'SSL': config.get('SSL', False),
+            'SSL_CERT_REQS': ssl_cert_reqs,
+        }
+    params.update({
+        'DB': config.get('DATABASE', 0),
+        'USERNAME': config.get('USERNAME', ''),
+        'PASSWORD': config.get('PASSWORD', ''),
+        'DEFAULT_TIMEOUT': default_timeout,
+    })
+    if ca_cert_path := config.get('CA_CERT_PATH', False):
+        params.setdefault('REDIS_CLIENT_KWARGS', {})
+        params['REDIS_CLIENT_KWARGS']['ssl_ca_certs'] = ca_cert_path
+    # Merge in KWARGS for additional parameters
+    if kwargs := config.get('KWARGS'):
+        params.setdefault('REDIS_CLIENT_KWARGS', {})
+        params['REDIS_CLIENT_KWARGS'].update(kwargs)
+    return params
+
+
+def build_caches(config):
+    """Build Django's CACHES setting and the django-redis connection factory from REDIS['caching'].
+
+    Returns a (CACHES, DJANGO_REDIS_CONNECTION_FACTORY) tuple. Sentinel takes precedence over URL,
+    which takes precedence over HOST/PORT.
+    """
+    username = config.get('USERNAME', '')
+    database = config.get('DATABASE', 0)
+    proto = 'rediss' if config.get('SSL', False) else 'redis'
+    username_host = '@'.join(filter(None, [username, config.get('HOST', 'localhost')]))
+    location = config.get('URL', f"{proto}://{username_host}:{config.get('PORT', 6379)}/{database}")
+    factory = 'django_redis.pool.ConnectionFactory'
+    options = {
+        'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+        'USERNAME': username,
+        'PASSWORD': config.get('PASSWORD', ''),
+    }
+
+    if sentinels := config.get('SENTINELS', []):
+        factory = 'django_redis.pool.SentinelConnectionFactory'
+        location = f"{proto}://{config.get('SENTINEL_SERVICE', 'default')}/{database}"
+        options['CLIENT_CLASS'] = 'django_redis.client.SentinelClient'
+        options['SENTINELS'] = sentinels
+    if config.get('INSECURE_SKIP_TLS_VERIFY', False):
+        options.setdefault('CONNECTION_POOL_KWARGS', {})
+        options['CONNECTION_POOL_KWARGS']['ssl_cert_reqs'] = False
+    if ca_cert_path := config.get('CA_CERT_PATH', False):
+        options.setdefault('CONNECTION_POOL_KWARGS', {})
+        options['CONNECTION_POOL_KWARGS']['ssl_ca_certs'] = ca_cert_path
+    # Merge in KWARGS for additional parameters
+    if kwargs := config.get('KWARGS'):
+        options.setdefault('CONNECTION_POOL_KWARGS', {})
+        options['CONNECTION_POOL_KWARGS'].update(kwargs)
+
+    caches = {
+        'default': {
+            'BACKEND': 'django_redis.cache.RedisCache',
+            'LOCATION': location,
+            'OPTIONS': options,
+        }
+    }
+    return caches, factory

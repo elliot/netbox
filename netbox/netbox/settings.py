@@ -19,11 +19,14 @@ from netbox.constants import RQ_QUEUE_DEFAULT, RQ_QUEUE_HIGH, RQ_QUEUE_LOW
 from netbox.plugins import PluginConfig
 from netbox.registry import registry
 from netbox.settings_utils import (
+    build_caches,
+    build_rq_params,
     get_configuration_dir,
     load_configuration,
     parse_job_timeout,
     resolve_install_paths,
     secret_key_hint,
+    uses_sentinel,
     validate_webhook_default_timeout,
 )
 from utilities.release import load_release_data
@@ -389,10 +392,7 @@ TASKS_REDIS_HOST = TASKS_REDIS.get('HOST', 'localhost')
 TASKS_REDIS_PORT = TASKS_REDIS.get('PORT', 6379)
 TASKS_REDIS_URL = TASKS_REDIS.get('URL')
 TASKS_REDIS_SENTINELS = TASKS_REDIS.get('SENTINELS', [])
-TASKS_REDIS_USING_SENTINEL = all([
-    isinstance(TASKS_REDIS_SENTINELS, (list, tuple)),
-    len(TASKS_REDIS_SENTINELS) > 0
-])
+TASKS_REDIS_USING_SENTINEL = uses_sentinel(TASKS_REDIS)
 TASKS_REDIS_SENTINEL_SERVICE = TASKS_REDIS.get('SENTINEL_SERVICE', 'default')
 TASKS_REDIS_SENTINEL_TIMEOUT = TASKS_REDIS.get('SENTINEL_TIMEOUT', 10)
 TASKS_REDIS_USERNAME = TASKS_REDIS.get('USERNAME', '')
@@ -419,34 +419,7 @@ CACHING_REDIS_CA_CERT_PATH = REDIS['caching'].get('CA_CERT_PATH', False)
 CACHING_REDIS_URL = REDIS['caching'].get('URL', f'{CACHING_REDIS_PROTO}://{CACHING_REDIS_USERNAME_HOST}:{CACHING_REDIS_PORT}/{CACHING_REDIS_DATABASE}')
 
 # Configure Django's default cache to use Redis
-CACHES = {
-    'default': {
-        'BACKEND': 'django_redis.cache.RedisCache',
-        'LOCATION': CACHING_REDIS_URL,
-        'OPTIONS': {
-            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
-            'USERNAME': CACHING_REDIS_USERNAME,
-            'PASSWORD': CACHING_REDIS_PASSWORD,
-        }
-    }
-}
-
-if CACHING_REDIS_SENTINELS:
-    DJANGO_REDIS_CONNECTION_FACTORY = 'django_redis.pool.SentinelConnectionFactory'
-    CACHES['default']['LOCATION'] = f'{CACHING_REDIS_PROTO}://{CACHING_REDIS_SENTINEL_SERVICE}/{CACHING_REDIS_DATABASE}'
-    CACHES['default']['OPTIONS']['CLIENT_CLASS'] = 'django_redis.client.SentinelClient'
-    CACHES['default']['OPTIONS']['SENTINELS'] = CACHING_REDIS_SENTINELS
-if CACHING_REDIS_SKIP_TLS_VERIFY:
-    CACHES['default']['OPTIONS'].setdefault('CONNECTION_POOL_KWARGS', {})
-    CACHES['default']['OPTIONS']['CONNECTION_POOL_KWARGS']['ssl_cert_reqs'] = False
-if CACHING_REDIS_CA_CERT_PATH:
-    CACHES['default']['OPTIONS'].setdefault('CONNECTION_POOL_KWARGS', {})
-    CACHES['default']['OPTIONS']['CONNECTION_POOL_KWARGS']['ssl_ca_certs'] = CACHING_REDIS_CA_CERT_PATH
-
-# Merge in KWARGS for additional parameters
-if caching_redis_kwargs := REDIS['caching'].get('KWARGS'):
-    CACHES['default']['OPTIONS'].setdefault('CONNECTION_POOL_KWARGS', {})
-    CACHES['default']['OPTIONS']['CONNECTION_POOL_KWARGS'].update(caching_redis_kwargs)
+CACHES, DJANGO_REDIS_CONNECTION_FACTORY = build_caches(REDIS['caching'])
 
 
 #
@@ -852,42 +825,7 @@ SPECTACULAR_SETTINGS = {
 # Django RQ (events backend)
 #
 
-if TASKS_REDIS_USING_SENTINEL:
-    RQ_PARAMS = {
-        'SENTINELS': TASKS_REDIS_SENTINELS,
-        'MASTER_NAME': TASKS_REDIS_SENTINEL_SERVICE,
-        'SOCKET_TIMEOUT': None,
-        'CONNECTION_KWARGS': {
-            'socket_connect_timeout': TASKS_REDIS_SENTINEL_TIMEOUT
-        },
-    }
-elif TASKS_REDIS_URL:
-    RQ_PARAMS = {
-        'URL': TASKS_REDIS_URL,
-        'SSL': TASKS_REDIS_SSL,
-        'SSL_CERT_REQS': None if TASKS_REDIS_SKIP_TLS_VERIFY else 'required',
-    }
-else:
-    RQ_PARAMS = {
-        'HOST': TASKS_REDIS_HOST,
-        'PORT': TASKS_REDIS_PORT,
-        'SSL': TASKS_REDIS_SSL,
-        'SSL_CERT_REQS': None if TASKS_REDIS_SKIP_TLS_VERIFY else 'required',
-    }
-RQ_PARAMS.update({
-    'DB': TASKS_REDIS_DATABASE,
-    'USERNAME': TASKS_REDIS_USERNAME,
-    'PASSWORD': TASKS_REDIS_PASSWORD,
-    'DEFAULT_TIMEOUT': RQ_DEFAULT_TIMEOUT,
-})
-if TASKS_REDIS_CA_CERT_PATH:
-    RQ_PARAMS.setdefault('REDIS_CLIENT_KWARGS', {})
-    RQ_PARAMS['REDIS_CLIENT_KWARGS']['ssl_ca_certs'] = TASKS_REDIS_CA_CERT_PATH
-
-# Merge in KWARGS for additional parameters
-if tasks_redis_kwargs := TASKS_REDIS.get('KWARGS'):
-    RQ_PARAMS.setdefault('REDIS_CLIENT_KWARGS', {})
-    RQ_PARAMS['REDIS_CLIENT_KWARGS'].update(tasks_redis_kwargs)
+RQ_PARAMS = build_rq_params(TASKS_REDIS, RQ_DEFAULT_TIMEOUT)
 
 # Define named RQ queues
 RQ_QUEUES = {
